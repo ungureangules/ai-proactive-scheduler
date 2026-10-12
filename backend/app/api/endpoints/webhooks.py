@@ -1,54 +1,97 @@
-from fastapi import APIRouter, Request, Depends
-from sqlalchemy.orm import Session
-from app.db.session import get_db
-from app.models.models import CommunicationLog, Client, Business
-from app.services.ai_agent import AIAgentService
-from app.services.twilio_whatsapp import TwilioWhatsAppService
-from datetime import datetime
+import logging
 
+from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.concurrency import run_in_threadpool
+from sqlalchemy import func
+
+from app.core.config import settings
+from app.db.session import SessionLocal
+from app.models.models import Client, CommunicationLog
+from app.services.event_parsing import normalize_phone
+from app.services.messaging import send_and_log
+from app.services.twilio_whatsapp import is_valid_request
+
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
-@router.post("/whatsapp")
-async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
-    form_data = await request.form()
-    from_number = form_data.get("From", "").replace("whatsapp:", "")
-    body = form_data.get("Body", "")
-    
-    # Find client by phone number
-    client = db.query(Client).filter(Client.phone_number == from_number).first()
-    if not client:
-        return {"status": "ignored", "reason": "Client not found"}
+EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
+OPT_OUT_WORDS = {"stop", "unsubscribe", "parar", "sair"}
+OPT_IN_WORDS = {"start", "unstop", "voltar"}
 
-    # Log the inbound message
-    log_in = CommunicationLog(
-        client_id=client.id,
-        message_body=body,
-        direction="inbound",
-        timestamp=datetime.utcnow()
+
+def _find_client(db, phone: str) -> Client | None:
+    """All businesses share one WhatsApp number, so pick the business that talked to this number last."""
+    clients = db.query(Client).filter(Client.phone_number == phone).all()
+    if len(clients) <= 1:
+        return clients[0] if clients else None
+    last_contact = dict(
+        db.query(CommunicationLog.client_id, func.max(CommunicationLog.timestamp))
+        .filter(CommunicationLog.client_id.in_([c.id for c in clients]))
+        .group_by(CommunicationLog.client_id)
+        .all()
     )
-    db.add(log_in)
-    
-    # Fetch chat history
-    history_logs = db.query(CommunicationLog).filter(CommunicationLog.client_id == client.id).order_by(CommunicationLog.timestamp.desc()).limit(10).all()
-    # Convert logs to format AIAgentService expects (this is simplified)
-    chat_history = [] # TODO: Map logs to Human/AI messages
-    
-    # Process with AI
-    ai_service = AIAgentService(business_id=client.business_id, db_session=db)
-    ai_response = ai_service.process_message(client_id=client.id, message_body=body, chat_history=chat_history)
-    
-    # Send response via Twilio
-    twilio_service = TwilioWhatsAppService()
-    twilio_service.send_message(to_number=client.phone_number, body=ai_response)
-    
-    # Log the outbound message
-    log_out = CommunicationLog(
-        client_id=client.id,
-        message_body=ai_response,
-        direction="outbound",
-        timestamp=datetime.utcnow()
-    )
-    db.add(log_out)
-    db.commit()
-    
-    return {"status": "success"}
+    with_history = [c for c in clients if c.id in last_contact]
+    if not with_history:
+        return clients[0]
+    return max(with_history, key=lambda c: last_contact[c.id])
+
+
+def process_inbound(params: dict) -> None:
+    from app.tasks.tasks import handle_inbound_message
+
+    db = SessionLocal()
+    try:
+        sid = params.get("MessageSid")
+        if sid and db.query(CommunicationLog.id).filter(CommunicationLog.provider_sid == sid).first():
+            return  # Twilio retried a webhook we already handled
+        phone = normalize_phone(params.get("From", ""))
+        client = _find_client(db, phone) if phone else None
+        if not client:
+            logger.info("Ignoring WhatsApp message from unknown number")
+            return
+
+        body = (params.get("Body") or "").strip()
+        if not body and params.get("NumMedia", "0") != "0":
+            body = "[media message]"
+        log = CommunicationLog(
+            business_id=client.business_id,
+            client_id=client.id,
+            message_body=body,
+            direction="inbound",
+            sender="client",
+            status="received",
+            provider_sid=sid,
+        )
+        db.add(log)
+        db.commit()
+
+        keyword = body.casefold()
+        if keyword in OPT_OUT_WORDS:
+            client.opted_out = True
+            db.commit()
+            send_and_log(db, client, "You won't receive any more messages from us. Reply START to opt back in.", sender="system")
+            return
+        if keyword in OPT_IN_WORDS and client.opted_out:
+            client.opted_out = False
+            db.commit()
+            send_and_log(db, client, "You're subscribed again. How can we help?", sender="system")
+            return
+        if not client.ai_paused and not client.opted_out:
+            handle_inbound_message.delay(log.id)
+    finally:
+        db.close()
+
+
+@router.post("/whatsapp")
+async def whatsapp_webhook(request: Request):
+    form = await request.form()
+    params = {key: value for key, value in form.items() if isinstance(value, str)}
+    # Twilio signs the exact public URL it called, which differs from request.url behind a proxy
+    url = settings.PUBLIC_BASE_URL.rstrip("/") + request.url.path
+    if request.url.query:
+        url += f"?{request.url.query}"
+    if not is_valid_request(url, params, request.headers.get("X-Twilio-Signature")):
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    await run_in_threadpool(process_inbound, params)
+    return Response(content=EMPTY_TWIML, media_type="application/xml")
